@@ -3,6 +3,7 @@ package com.example.asr
 import android.content.Context
 import android.os.StatFs
 import android.util.Log
+import com.example.BuildConfig
 import com.example.service.NotificationHelper
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -394,6 +395,16 @@ class ModelManager(private val context: Context) {
         const val VAD_FILENAME = "silero_vad.onnx"
         const val VAD_URL = "$RELEASE_URL/silero_vad.onnx"
 
+        // Noise remover (GTCRN speech enhancement, 0.5 MB) that cleans audio before speech
+        // recognition, stored in models/<DENOISER_DIR>/. The checksum is from the release's
+        // checksum.txt: a damaged model can abort the app in native code, so only the exact
+        // published file is installed.
+        const val DENOISER_DIR = "_denoiser"
+        const val DENOISER_FILENAME = "gtcrn_simple.onnx"
+        const val DENOISER_URL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/gtcrn_simple.onnx"
+        const val DENOISER_SHA256 = "e77603ac0c23dac3227dd2d7135b3a585cbee2679048aecfa886657d3ae1b534"
+        private const val DENOISER_MIN_BYTES = 400_000L
+
         // Old storage layout: one flat folder shared by every model. Only read by the migration.
         const val LEGACY_FLAT_DIR = "models/sherpa-onnx"
 
@@ -403,6 +414,8 @@ class ModelManager(private val context: Context) {
         private const val KEY_MODE = "recognition_mode"
         // Set while native code loads a model; still set on the next start means that load crashed the app
         private const val KEY_LOADING_MODEL_ID = "loading_model_id"
+        // App version whose noise remover crashed on load; it stays off until the app is updated
+        private const val KEY_DENOISER_CRASHED_VERSION = "denoiser_crashed_version"
 
         // A model is unpacked into models/<id><STAGING_SUFFIX>/ and moved into place only when complete
         const val STAGING_SUFFIX = ".installing"
@@ -524,6 +537,14 @@ class ModelManager(private val context: Context) {
     internal fun removeModelThatCrashedOnLoad(): AsrModelConfig? {
         val crashedId = prefs.getString(KEY_LOADING_MODEL_ID, null) ?: return null
         prefs.edit().remove(KEY_LOADING_MODEL_ID).commit()
+        if (crashedId == DENOISER_DIR) {
+            // The file was checked against its checksum, so downloading it again would crash
+            // again: noise removal stays off until the app is updated
+            Log.e(TAG, "Loading the noise remover crashed the app last time; turning it off for this version")
+            denoiserModelFile().delete()
+            prefs.edit().putInt(KEY_DENOISER_CRASHED_VERSION, BuildConfig.VERSION_CODE).commit()
+            return null
+        }
         val model = availableModels.firstOrNull { it.id == crashedId } ?: return null
         Log.e(TAG, "Loading ${model.id} crashed the app last time; removing its files")
         getModelDirectory(model).deleteRecursively()
@@ -547,7 +568,7 @@ class ModelManager(private val context: Context) {
                     Log.i(TAG, "Deleting legacy flat model folder (retired model)")
                     legacyDir.deleteRecursively()
                 }
-                val knownIds = availableModels.map { it.id }.toSet() + VAD_DIR
+                val knownIds = availableModels.map { it.id }.toSet() + VAD_DIR + DENOISER_DIR
                 getModelsDirectory().listFiles()?.forEach { dir ->
                     if (dir.isDirectory && dir.name !in knownIds) {
                         if (dir.name.endsWith(STAGING_SUFFIX)) {
@@ -771,26 +792,78 @@ class ModelManager(private val context: Context) {
     /** Downloads the small speech detector model if it is missing. Throws on failure. */
     private fun ensureVadInstalled() {
         if (isVadInstalled()) return
-        requireHttpsUrl(VAD_URL)
-        val target = vadModelFile()
+        downloadSingleFile(VAD_URL, vadModelFile(), minBytes = 100_000L, sha256 = null, label = "Speech detector")
+    }
+
+    // ---- Noise remover (GTCRN) used before speech recognition ----
+
+    fun denoiserModelFile(): File = File(File(getModelsDirectory(), DENOISER_DIR), DENOISER_FILENAME)
+
+    fun isDenoiserInstalled(): Boolean = hasUsableModelFile(denoiserModelFile(), DENOISER_MIN_BYTES)
+
+    /** False after the noise remover crashed the app on load, until the app is updated. */
+    fun isDenoiserAllowed(): Boolean =
+        prefs.getInt(KEY_DENOISER_CRASHED_VERSION, -1) != BuildConfig.VERSION_CODE
+
+    /**
+     * Downloads the noise remover (0.5 MB) if it is missing. Blocking; call it off the main
+     * thread. Throws on failure; a short time limit keeps a bad connection from holding up Start.
+     */
+    fun ensureDenoiserInstalled() {
+        if (isDenoiserInstalled() || !isDenoiserAllowed()) return
+        downloadSingleFile(
+            DENOISER_URL, denoiserModelFile(), minBytes = DENOISER_MIN_BYTES, sha256 = DENOISER_SHA256,
+            label = "Noise remover", client = httpClient.newBuilder().callTimeout(20, TimeUnit.SECONDS).build()
+        )
+    }
+
+    /**
+     * Downloads one model file to [target]: into a temporary file first, checked (size, and
+     * [sha256] when given), then moved into place in one step, so a cut-off or wrong download
+     * never looks installed.
+     */
+    private fun downloadSingleFile(
+        url: String,
+        target: File,
+        minBytes: Long,
+        sha256: String?,
+        label: String,
+        client: OkHttpClient = httpClient
+    ) {
+        requireHttpsUrl(url)
         target.parentFile?.mkdirs()
-        val temp = File(target.parentFile, "$VAD_FILENAME.download")
-        val request = Request.Builder().url(VAD_URL).build()
+        val temp = File(target.parentFile, "${target.name}.download")
+        val request = Request.Builder().url(url).build()
         try {
-            httpClient.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) throw IOException("Speech detector download failed (HTTP ${response.code})")
+            client.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) throw IOException("$label download failed (HTTP ${response.code})")
                 val body = response.body ?: throw IOException("Empty response body")
                 body.byteStream().use { input -> FileOutputStream(temp).use { output -> input.copyTo(output) } }
             }
-            // rename() replaces an old target file in one step on Android
-            if (temp.length() < 100_000L || !temp.renameTo(target)) {
-                throw IOException("Speech detector download is incomplete")
+            if (temp.length() < minBytes) throw IOException("$label download is incomplete")
+            if (sha256 != null && !sha256.equals(sha256Of(temp), ignoreCase = true)) {
+                throw IOException("$label download is damaged (checksum mismatch)")
             }
+            // rename() replaces an old target file in one step on Android
+            if (!temp.renameTo(target)) throw IOException("$label could not be installed")
         } finally {
             // A download cut off part-way leaves no partial file behind
             if (temp.exists()) temp.delete()
         }
-        Log.i(TAG, "Speech detector installed (${target.length()} bytes)")
+        Log.i(TAG, "$label installed (${target.length()} bytes)")
+    }
+
+    private fun sha256Of(file: File): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     /**
@@ -884,6 +957,13 @@ class ModelManager(private val context: Context) {
             report(ModelDownloadState.Downloading(0, model.totalSizeBytes, 0f))
             // Accuracy-mode models need the speech detector (under 1 MB) to find phrases
             if (model.mode == RecognitionMode.ACCURACY) ensureVadInstalled()
+            // Both latencies use the noise remover; without it, audio is used as it is
+            try {
+                ensureDenoiserInstalled()
+            } catch (e: Exception) {
+                if (e is CancellationException) throw e
+                Log.w(TAG, "Noise remover download failed: ${e.message}")
+            }
 
             val request = Request.Builder()
                 .url(model.downloadUrl)

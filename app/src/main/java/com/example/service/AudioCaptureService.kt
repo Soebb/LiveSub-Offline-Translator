@@ -16,6 +16,8 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import com.example.audio.AudioUtils
+import com.example.audio.NoiseReducer
+import com.example.audio.NoiseReduction
 import com.example.asr.ModelManager
 import com.example.asr.SpeechRecognizerEngine
 import com.example.asr.SpeechValidator
@@ -58,6 +60,7 @@ class AudioCaptureService : Service() {
     @Volatile private var isVoiceIsolationActive = true
     @Volatile private var noiseGateLevel = 0f
     @Volatile private var isQuietVoiceBoostActive = true
+    @Volatile private var noiseReductionLevel = NoiseReduction.DEFAULT
     @Volatile private var isDebugRecordingActive = false
     // "Open subtitles when starting": the floating window it opened closes again with every stop
     @Volatile private var isAutoOverlayEnabled = true
@@ -91,6 +94,9 @@ class AudioCaptureService : Service() {
         // NPE under concurrent access (e.g., Quick Settings tile + main app starting simultaneously).
         // Pattern mirrors AppDatabase.getInstance() which already does this correctly.
         @Volatile private var sharedModelManager: ModelManager? = null
+        // The noise remover is fetched at Start at most once per run, so a bad connection
+        // doesn't slow every Start
+        @Volatile private var triedDenoiserDownload = false
         @Volatile private var sharedSpeechEngine: SpeechRecognizerEngine? = null
         @Volatile private var sharedTranslatorEngine: LocalTranslatorEngine? = null
 
@@ -217,6 +223,7 @@ class AudioCaptureService : Service() {
             settingsRepo.settingsFlow.collect { settings ->
                 isVoiceIsolationActive = settings.isVoiceIsolationEnabled
                 isQuietVoiceBoostActive = settings.isQuietVoiceBoostEnabled
+                noiseReductionLevel = NoiseReduction.fromCode(settings.noiseReduction)
                 isDebugRecordingActive = settings.isDebugAudioRecordingEnabled
                 noiseGateLevel = settings.noiseGateThreshold
                 isAutoOverlayEnabled = settings.isAutoOverlayEnabled
@@ -577,6 +584,7 @@ class AudioCaptureService : Service() {
                 val settings = settingsRepo.settingsFlow.first()
                 isVoiceIsolationActive = settings.isVoiceIsolationEnabled
                 isQuietVoiceBoostActive = settings.isQuietVoiceBoostEnabled
+                noiseReductionLevel = NoiseReduction.fromCode(settings.noiseReduction)
                 isDebugRecordingActive = settings.isDebugAudioRecordingEnabled
                 noiseGateLevel = settings.noiseGateThreshold
                 speechEngine.silenceEndpointDelay = settings.silenceEndpointDelay
@@ -620,6 +628,10 @@ class AudioCaptureService : Service() {
                 return@launch
             }
             _serviceErrorMessage.value = null
+
+            // Background noise removal, the first clean-up step (see NoiseReducer). Used and
+            // released by the audio thread below; null = audio is used as it is.
+            val noiseReducer = createNoiseReducer()
 
             // Dedicated High-Priority Audio Buffer:
             // Push raw PCM chunks immediately into a buffered Kotlin Channel<FloatArray>(capacity = AUDIO_BUFFER_CAPACITY).
@@ -668,7 +680,8 @@ class AudioCaptureService : Service() {
                     }
                 } else null
                 // Input level statistics, logged every 5 seconds
-                var statSamples = 0
+                var statRawSamples = 0
+                var statSentSamples = 0
                 var statRawSq = 0.0
                 var statSentSq = 0.0
                 var statPeak = 0f
@@ -699,10 +712,19 @@ class AudioCaptureService : Service() {
                                 AudioUtils.toMonoFloats(shortBuffer, readShorts, isStereo)
                             )
                             if (floatSamples.isEmpty()) continue
+                            for (raw in floatSamples) {
+                                statRawSq += raw * raw
+                                if (kotlin.math.abs(raw) > statPeak) statPeak = kotlin.math.abs(raw)
+                            }
+                            statRawSamples += floatSamples.size
 
-                            // Optional rumble filter and noise gate (see VoiceIsolationProcessor)
-                            val processedSamples = voiceIsolationProcessor.process(
-                                input = floatSamples,
+                            // First: remove background noise, so the boost below lifts the voice and
+                            // not the noise. It works in 16 ms steps and may hold back a few samples.
+                            val cleanedSamples = noiseReducer?.process(floatSamples, noiseReductionLevel) ?: floatSamples
+
+                            // Optional rumble filter, quiet-voice boost and noise gate (see VoiceIsolationProcessor)
+                            val processedSamples = if (cleanedSamples.isEmpty()) cleanedSamples else voiceIsolationProcessor.process(
+                                input = cleanedSamples,
                                 noiseGateThreshold = noiseGateLevel,
                                 isFilterEnabled = isVoiceIsolationActive,
                                 boostQuietVoices = isQuietVoiceBoostActive
@@ -710,7 +732,7 @@ class AudioCaptureService : Service() {
 
                             // Non-blocking push. If the recognizer has fallen behind and the buffer is full,
                             // drop the oldest chunk so the newest audio is kept, and count the drop.
-                            if (!audioBufferChannel.trySend(processedSamples).isSuccess) {
+                            if (processedSamples.isNotEmpty() && !audioBufferChannel.trySend(processedSamples).isSuccess) {
                                 audioBufferChannel.tryReceive()
                                 audioBufferChannel.trySend(processedSamples)
                                 droppedAudioChunks++
@@ -719,31 +741,34 @@ class AudioCaptureService : Service() {
                                 }
                             }
 
-                            debugRecorder?.write(processedSamples)
-                            for (i in processedSamples.indices) {
-                                val raw = floatSamples[i]
-                                val sent = processedSamples[i]
-                                statRawSq += raw * raw
+                            if (processedSamples.isNotEmpty()) debugRecorder?.write(processedSamples)
+                            for (sent in processedSamples) {
                                 statSentSq += sent * sent
-                                if (kotlin.math.abs(raw) > statPeak) statPeak = kotlin.math.abs(raw)
                                 if (kotlin.math.abs(sent) >= 0.98f) statClipped++
                             }
-                            statSamples += processedSamples.size
-                            if (statSamples >= 16000 * 5) {
-                                fun dbfs(sq: Double) = if (sq <= 0.0) -120.0 else 10 * kotlin.math.log10(sq / statSamples)
+                            statSentSamples += processedSamples.size
+                            if (statRawSamples >= 16000 * 5) {
+                                fun dbfs(sq: Double, count: Int) = if (sq <= 0.0 || count == 0) -120.0 else 10 * kotlin.math.log10(sq / count)
+                                // How much quieter the noise remover made the audio, and its cost
+                                val noiseStats = noiseReducer?.takeStats()
+                                val noiseText = if (noiseStats == null || noiseReductionLevel == NoiseReduction.OFF) "off"
+                                    else String.format(java.util.Locale.US, "%s %.1f dB, %.1f ms per s",
+                                        noiseReductionLevel.label, noiseStats.reductionDb, noiseStats.msPerSecond)
                                 Log.i(TAG, String.format(java.util.Locale.US,
-                                    "Input level (5 s): captured %.1f dBFS (peak %.1f), sent to recognizer %.1f dBFS, clipped %.2f%%, dropped chunks %d",
-                                    dbfs(statRawSq),
+                                    "Input level (5 s): captured %.1f dBFS (peak %.1f), noise removal %s, sent to recognizer %.1f dBFS, clipped %.2f%%, dropped chunks %d",
+                                    dbfs(statRawSq, statRawSamples),
                                     if (statPeak > 0f) 20 * kotlin.math.log10(statPeak.toDouble()) else -120.0,
-                                    dbfs(statSentSq),
-                                    100.0 * statClipped / statSamples,
+                                    noiseText,
+                                    dbfs(statSentSq, statSentSamples),
+                                    if (statSentSamples > 0) 100.0 * statClipped / statSentSamples else 0.0,
                                     droppedAudioChunks))
-                                statSamples = 0; statRawSq = 0.0; statSentSq = 0.0; statPeak = 0f; statClipped = 0
+                                statRawSamples = 0; statSentSamples = 0; statRawSq = 0.0; statSentSq = 0.0; statPeak = 0f; statClipped = 0
                             }
 
                             // Calculate RMS dB for UI visualizer
-                            val db = AudioUtils.calculateDbLevel(processedSamples)
-                            _liveAudioDb.value = db
+                            if (processedSamples.isNotEmpty()) {
+                                _liveAudioDb.value = AudioUtils.calculateDbLevel(processedSamples)
+                            }
                         }
                     }
                 } catch (e: Exception) {
@@ -759,6 +784,7 @@ class AudioCaptureService : Service() {
                         record.release()
                     } catch (_: Exception) {}
                     try { debugRecorder?.close() } catch (_: Exception) {}
+                    noiseReducer?.release()
                     audioBufferChannel.close()
                     // Must not throw out of this thread's cleanup (an uncaught exception here
                     // would crash the app)
@@ -794,6 +820,42 @@ class AudioCaptureService : Service() {
                     Log.w(TAG, "Capture ended with $droppedAudioChunks dropped audio chunk(s)")
                 }
             }
+        }
+    }
+
+    /**
+     * Loads the noise remover for this capture, fetching its 0.5 MB model first if needed.
+     * Returns null when noise removal is off, or its model is missing or can't be loaded; the
+     * audio is then used as it is.
+     */
+    private suspend fun createNoiseReducer(): NoiseReducer? {
+        if (noiseReductionLevel == NoiseReduction.OFF) return null
+        val modelManager = getModelManager(this)
+        if (!modelManager.isDenoiserAllowed()) {
+            Log.w(TAG, "Noise removal is off: it crashed on this phone before")
+            return null
+        }
+        if (!modelManager.isDenoiserInstalled() && !triedDenoiserDownload) {
+            triedDenoiserDownload = true
+            try {
+                kotlinx.coroutines.withContext(Dispatchers.IO) { modelManager.ensureDenoiserInstalled() }
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                Log.w(TAG, "Noise remover download failed; starting without it: ${e.message}")
+            }
+        }
+        if (!modelManager.isDenoiserInstalled()) return null
+        return try {
+            // A crash while loading turns noise removal off on the next start (see ModelManager)
+            modelManager.beginNativeLoad(ModelManager.DENOISER_DIR)
+            try {
+                NoiseReducer.loadGtcrn(modelManager.denoiserModelFile())
+            } finally {
+                modelManager.endNativeLoad()
+            }.also { Log.i(TAG, "Noise removal on (${noiseReductionLevel.label})") }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Could not load the noise remover; starting without it", t)
+            null
         }
     }
 

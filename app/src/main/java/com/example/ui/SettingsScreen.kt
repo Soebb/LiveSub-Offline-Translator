@@ -49,6 +49,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.audio.NoiseReduction
 import com.example.data.AppSettings
 import kotlinx.coroutines.launch
 import java.util.Locale
@@ -104,6 +105,15 @@ private fun UserSettings(
                 onSelect = { viewModel.setRecognitionMode(it) },
                 onOpenModels = onOpenModels
             )
+
+            ChoiceSetting(
+                title = "Background noise removal",
+                subtitle = "Cleans crowd, street and other background sound out of the audio before speech is recognized. " +
+                    "Strong removes the most, but can blur soft words. Default: Normal",
+                options = NoiseReduction.entries.map { it.code to it.label },
+                selected = NoiseReduction.fromCode(settings.noiseReduction).code,
+                tagPrefix = "chip_noise_reduction_"
+            ) { scope.launch { repo.updateNoiseReduction(it) } }
         }
 
         SettingsGroup(icon = Icons.Default.Subtitles, title = "Subtitles") {
