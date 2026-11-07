@@ -310,7 +310,12 @@ class SpeechRecognizerEngine(
                 _engineState.value = RecognizerState.Initializing
                 return@withLock try {
                     val loaded = loadNative(wantedVoskId) { VoskNativeModel(selectedVosk.directory.absolutePath) }
-                    val recognizer = VoskNativeRecognizer(loaded, 16000.0f)
+                    val recognizer = VoskNativeRecognizer(loaded, 16000.0f).apply {
+                        // We only need transcript text; word timings and alternatives add work
+                        // without being used by LiveSub's subtitle pipeline.
+                        setWords(false)
+                        setMaxAlternatives(0)
+                    }
                     synchronized(recognizerLock) {
                         releaseRecognizersLocked()
                         voskModel = loaded
