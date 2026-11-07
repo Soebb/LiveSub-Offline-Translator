@@ -13,6 +13,9 @@ jobs:
   build:
     name: Build Android debug APK
     runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
     steps:
       - name: Check out source
@@ -24,17 +27,18 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          accept-android-sdk-licenses: false
-
+      # GitHub-hosted Ubuntu runners already include the Android SDK.
+      # Use its installed sdkmanager directly; setup-android attempts to
+      # install the obsolete "tools" package, which is no longer available.
       - name: Accept Android SDK licenses
-        run: yes | sdkmanager --licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses
 
       - name: Install Android SDK components
         run: |
-          sdkmanager "platforms;android-36.1" "build-tools;36.1.0" "ndk;27.2.12479018"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36.1" \
+            "build-tools;36.1.0" \
+            "ndk;27.2.12479018"
 
       - name: Build debug APK
         run: |
