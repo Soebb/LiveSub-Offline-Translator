@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - perf/vosk-streaming-low-latency
   workflow_dispatch:
 
 permissions:
